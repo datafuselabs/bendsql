@@ -196,6 +196,21 @@ pub trait Connection: DynClone + Send + Sync {
         ))
     }
 
+    async fn begin(&self) -> Result<()> {
+        self.exec("BEGIN").await?;
+        Ok(())
+    }
+
+    async fn commit(&self) -> Result<()> {
+        self.exec("COMMIT").await?;
+        Ok(())
+    }
+
+    async fn rollback(&self) -> Result<()> {
+        self.exec("ROLLBACK").await?;
+        Ok(())
+    }
+
     async fn get_files(&self, stage: &str, local_file: &str) -> Result<RowStatsIterator> {
         let mut total_count: usize = 0;
         let mut total_size: usize = 0;
