@@ -12,15 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod client;
+const SessionTokenExpired: u16 = 5100;
+const RefreshTokenExpired: u16 = 5100;
+const SessionTokenNotFound: u16 = 5100;
+const RefreshTokenNotFound: u16 = 5100;
 
-pub mod auth;
-pub mod error;
-pub mod error_code;
-mod login;
-pub mod presign;
-pub mod request;
-pub mod response;
-pub mod stage;
-
-pub use client::APIClient;
+pub fn need_renew_token(code: u16) -> bool {
+    code == SessionTokenExpired || code == SessionTokenNotFound
+}
