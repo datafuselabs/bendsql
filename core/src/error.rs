@@ -24,6 +24,7 @@ pub enum Error {
     // on accessing this next page uri.
     QueryExpired(String),
     InvalidResponse(response::QueryError),
+    AuthFailure(response::QueryError),
 }
 
 impl std::fmt::Display for Error {
@@ -39,6 +40,12 @@ impl std::fmt::Display for Error {
                     write!(f, "ResponseError with {}: {}\n{}", e.code, e.message, d)
                 }
                 _ => write!(f, "ResponseError with {}: {}", e.code, e.message),
+            },
+            Error::AuthFailure(e) => match &e.detail {
+                Some(d) if !d.is_empty() => {
+                    write!(f, "AuthFailure with {}: {}\n{}", e.code, e.message, d)
+                }
+                _ => write!(f, "AuthFailure with {}: {}", e.code, e.message),
             },
         }
     }
