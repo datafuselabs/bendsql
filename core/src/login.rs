@@ -14,8 +14,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::error_code::ErrorCode;
 use crate::request::SessionState;
-use crate::response::QueryError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Debug)]
@@ -31,11 +31,15 @@ pub struct LoginRequest {
 impl From<&SessionState> for LoginRequest {
     fn from(value: &SessionState) -> Self {
         Self {
-            database: value.database.clone(),
             role: value.role.clone(),
             settings: value.settings.clone(),
+            database: value.database.clone(),
         }
     }
+}
+
+fn default_session_token_validity_in_secs() -> u64 {
+    3600
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -43,6 +47,7 @@ pub struct LoginInfo {
     pub version: String,
     pub session_id: String,
     pub session_token: String,
+    #[serde(default = "default_session_token_validity_in_secs")]
     pub session_token_validity_in_secs: u64,
     pub refresh_token: String,
     #[allow(dead_code)]
@@ -50,15 +55,14 @@ pub struct LoginInfo {
 }
 
 impl LoginInfo {
-    pub fn may_need_renew_token() {
-    }
+    pub fn may_need_renew_token() {}
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(untagged)]
 pub enum LoginResponse {
     Ok(LoginInfo),
-    Err { error: QueryError },
+    Err { error: ErrorCode },
 }
 
 #[derive(Serialize, Debug)]
@@ -78,5 +82,10 @@ pub struct RenewInfo {
 #[serde(untagged)]
 pub enum RenewResponse {
     Ok(RenewInfo),
-    Err { error: QueryError },
+    Err { error: ErrorCode },
+}
+
+#[derive(Serialize, Debug)]
+pub struct LogoutRequest {
+    pub refresh_token: String,
 }

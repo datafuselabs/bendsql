@@ -19,6 +19,9 @@ use crate::error::{Error, Result};
 #[async_trait::async_trait]
 pub trait Auth: Sync + Send {
     async fn wrap(&self, builder: RequestBuilder) -> Result<RequestBuilder>;
+    fn can_reload(&self) -> bool {
+        false
+    }
     fn username(&self) -> String;
 }
 
@@ -96,6 +99,10 @@ impl Auth for AccessTokenFileAuth {
                 ))
             })?;
         Ok(builder.bearer_auth(token.trim()))
+    }
+
+    fn can_reload(&self) -> bool {
+        true
     }
 
     fn username(&self) -> String {

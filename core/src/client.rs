@@ -13,30 +13,35 @@
 // limitations under the License.
 
 use std::collections::BTreeMap;
+use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-
-use log::{info, warn};
-use once_cell::sync::Lazy;
-use percent_encoding::percent_decode_str;
-use reqwest::header::HeaderMap;
-use reqwest::multipart::{Form, Part};
-use reqwest::{Body, Client as HttpClient};
-use tokio::sync::Mutex;
-use tokio_retry::strategy::{jitter, ExponentialBackoff};
-use tokio_retry::Retry;
-use tokio_util::io::ReaderStream;
-use url::Url;
+use std::time::{Duration, Instant};
 
 use crate::auth::{AccessTokenAuth, AccessTokenFileAuth, Auth, BasicAuth};
+use crate::error_code::{need_renew_token, ResponseWithErrorCode};
+use crate::login::{
+    LoginInfo, LoginRequest, LoginResponse, LogoutRequest, RenewRequest, RenewResponse,
+};
 use crate::presign::{presign_upload_to_stage, PresignMode, PresignedResponse, Reader};
 use crate::stage::StageLocation;
 use crate::{
     error::{Error, Result},
     request::{PaginationConfig, QueryRequest, SessionState, StageAttachmentConfig},
-    response::{QueryError, QueryResponse},
+    response::QueryResponse,
 };
+use log::{info, warn};
+use once_cell::sync::Lazy;
+use percent_encoding::percent_decode_str;
+use reqwest::header::HeaderMap;
+use reqwest::multipart::{Form, Part};
+use reqwest::{Body, Client as HttpClient, Request, RequestBuilder, Response, StatusCode};
+use serde::Deserialize;
+use tokio::sync::Mutex;
+use tokio::time::sleep;
+use tokio_retry::strategy::jitter;
+use tokio_util::io::ReaderStream;
+use url::Url;
 
 const HEADER_QUERY_ID: &str = "X-DATABEND-QUERY-ID";
 const HEADER_TENANT: &str = "X-DATABEND-TENANT";
@@ -62,9 +67,12 @@ pub struct APIClient {
     auth: Arc<dyn Auth>,
 
     tenant: Option<String>,
-    warehouse: Arc<Mutex<Option<String>>>,
+    warehouse: Arc<parking_lot::Mutex<Option<String>>>,
     session_state: Arc<Mutex<SessionState>>,
     route_hint: Arc<RouteHintGenerator>,
+
+    disable_session_token: bool,
+    login_info: Option<Arc<parking_lot::Mutex<(LoginInfo, Instant)>>>,
 
     wait_time_secs: Option<i64>,
     max_rows_in_buffer: Option<i64>,
@@ -83,6 +91,9 @@ impl APIClient {
         let mut client = Self::from_dsn(dsn).await?;
         client.build_client(name).await?;
         client.check_presign().await?;
+        if !client.disable_session_token {
+            client.login().await?;
+        }
         Ok(client)
     }
 
@@ -141,7 +152,7 @@ impl APIClient {
                     client.tenant = Some(v.to_string());
                 }
                 "warehouse" => {
-                    client.warehouse = Arc::new(Mutex::new(Some(v.to_string())));
+                    client.warehouse = Arc::new(parking_lot::Mutex::new(Some(v.to_string())));
                 }
                 "role" => role = Some(v.to_string()),
                 "sslmode" => match v.as_ref() {
@@ -162,6 +173,18 @@ impl APIClient {
                 }
                 "access_token_file" => {
                     client.auth = Arc::new(AccessTokenFileAuth::new(v));
+                }
+                "session_token" => {
+                    client.disable_session_token = match v.as_ref() {
+                        "disable" => true,
+                        "enable" => false,
+                        _ => {
+                            return Err(Error::BadArgument(format!(
+                                "Invalid value for session_token: {}",
+                                v
+                            )))
+                        }
+                    }
                 }
                 _ => {
                     session_settings.insert(k.to_string(), v.to_string());
@@ -231,7 +254,7 @@ impl APIClient {
     }
 
     pub async fn current_warehouse(&self) -> Option<String> {
-        let guard = self.warehouse.lock().await;
+        let guard = self.warehouse.lock();
         guard.clone()
     }
 
@@ -277,7 +300,7 @@ impl APIClient {
         // process warehouse changed via session settings
         if let Some(settings) = session.settings.as_ref() {
             if let Some(v) = settings.get("warehouse") {
-                let mut warehouse = self.warehouse.lock().await;
+                let mut warehouse = self.warehouse.lock();
                 *warehouse = Some(v.clone());
             }
         }
@@ -292,53 +315,51 @@ impl APIClient {
     }
 
     pub async fn start_query(&self, sql: &str) -> Result<QueryResponse> {
-        info!("start query: {}", sql);
+        self.start_query_inner(sql, None).await
+    }
+
+    async fn wrap_auth_or_session_token(&self, builder: RequestBuilder) -> Result<RequestBuilder> {
+        if let Some(info) = &self.login_info {
+            let info = info.lock();
+            Ok(builder.bearer_auth(info.0.session_token.clone()))
+        } else {
+            self.auth.wrap(builder).await
+        }
+    }
+
+    async fn start_query_inner(
+        &self,
+        sql: &str,
+        stage_attachment_config: Option<StageAttachmentConfig<'_>>,
+    ) -> Result<QueryResponse> {
         if !self.in_active_transaction().await {
             self.route_hint.next();
         }
+        let endpoint = self.endpoint.join("v1/query")?;
+
+        // body
         let session_state = self.session_state().await;
         let req = QueryRequest::new(sql)
             .with_pagination(self.make_pagination())
-            .with_session(Some(session_state));
-        let endpoint = self.endpoint.join("v1/query")?;
-        let query_id = self.gen_query_id();
-        let headers = self.make_headers(&query_id).await?;
-        let mut builder = self.cli.post(endpoint.clone()).json(&req);
-        builder = self.auth.wrap(builder).await?;
-        let mut resp = builder.headers(headers.clone()).send().await?;
-        let mut retries = 3;
-        while resp.status() != 200 {
-            if resp.status() != 503 || retries <= 0 {
-                break;
-            }
-            retries -= 1;
-            let mut builder = self.cli.post(endpoint.clone()).json(&req);
-            builder = self.auth.wrap(builder).await?;
-            resp = builder.headers(headers.clone()).send().await?;
-        }
-        if resp.status() != 200 {
-            if resp.status() == 401 {
-                let resp_err = QueryError {
-                    code: resp.status().as_u16(),
-                    message: resp.text().await.unwrap_or_default(),
-                    detail: None,
-                };
-                return Err(Error::InvalidResponse(resp_err));
-            }
-            return Err(Error::Request(format!(
-                "Start Query failed with status {}: {}",
-                resp.status(),
-                resp.text().await?
-            )));
-        }
+            .with_session(Some(session_state))
+            .with_stage_attachment(stage_attachment_config);
 
-        if let Some(route_hint) = resp.headers().get(HEADER_ROUTE_HINT) {
+        // headers
+        let query_id = self.gen_query_id();
+        let headers = self.make_headers(Some(&query_id))?;
+
+        let mut builder = self.cli.post(endpoint.clone()).json(&req);
+        builder = self.wrap_auth_or_session_token(builder).await?;
+        let request = builder.headers(headers.clone()).build()?;
+        let response = self.query_request_helper(request, true, true).await?;
+        if let Some(route_hint) = response.headers().get(HEADER_ROUTE_HINT) {
             self.route_hint.set(route_hint.to_str().unwrap_or_default());
         }
-        let result: QueryResponse = resp.json().await?;
+        let body = response.bytes().await?;
+        let result: QueryResponse = json_from_slice(&body)?;
         self.handle_session(&result.session).await;
         if let Some(err) = result.error {
-            return Err(Error::InvalidResponse(err));
+            return Err(Error::QueryFailed(err));
         }
         self.handle_warnings(&result);
         Ok(result)
@@ -347,45 +368,27 @@ impl APIClient {
     pub async fn query_page(&self, query_id: &str, next_uri: &str) -> Result<QueryResponse> {
         info!("query page: {}", next_uri);
         let endpoint = self.endpoint.join(next_uri)?;
-        let headers = self.make_headers(query_id).await?;
-        let retry_strategy = ExponentialBackoff::from_millis(10).map(jitter).take(3);
-        let req = || async {
-            let mut builder = self.cli.get(endpoint.clone());
-            builder = self.auth.wrap(builder).await?;
-            builder
-                .headers(headers.clone())
-                .timeout(self.page_request_timeout)
-                .send()
-                .await
-                .map_err(Error::from)
-        };
-        let resp = Retry::spawn(retry_strategy, req).await?;
-        if resp.status() != 200 {
-            // TODO(liyz): currently it's not possible to distinguish between session timeout and server crashed
-            if resp.status() == 404 {
-                return Err(Error::SessionTimeout(resp.text().await?));
+        let headers = self.make_headers(Some(query_id))?;
+        let mut builder = self.cli.get(endpoint.clone());
+        builder = self.wrap_auth_or_session_token(builder).await?;
+        let request = builder
+            .headers(headers.clone())
+            .timeout(self.page_request_timeout)
+            .build()?;
+
+        let response = self.query_request_helper(request, false, true).await?;
+        let body = response.bytes().await?;
+        let resp: QueryResponse = json_from_slice(&body).map_err(|e| {
+            if let Error::Logic(status, ec) = &e {
+                if *status == 404 {
+                    return Error::QueryNotFound(ec.message.clone());
+                }
             }
-            if resp.status() == 401 {
-                let resp_err = QueryError {
-                    code: resp.status().as_u16(),
-                    message: resp.text().await.unwrap_or_default(),
-                    detail: None,
-                };
-                return Err(Error::InvalidResponse(resp_err));
-            }
-            return Err(Error::Request(format!(
-                "Query Page failed with status {}: {}",
-                resp.status(),
-                resp.text().await?
-            )));
-        }
-        let resp: QueryResponse = resp.json().await?;
+            e
+        })?;
         self.handle_session(&resp.session).await;
-        // TODO: duplicate warnings with start_query,
-        // maybe we should only print warnings on final response
-        // self.handle_warnings(&resp);
         match resp.error {
-            Some(err) => Err(Error::InvalidResponse(err)),
+            Some(err) => Err(Error::QueryFailed(err)),
             None => Ok(resp),
         }
     }
@@ -393,17 +396,13 @@ impl APIClient {
     pub async fn kill_query(&self, query_id: &str, kill_uri: &str) -> Result<()> {
         info!("kill query: {}", kill_uri);
         let endpoint = self.endpoint.join(kill_uri)?;
-        let headers = self.make_headers(query_id).await?;
+        let headers = self.make_headers(Some(query_id))?;
         let mut builder = self.cli.post(endpoint.clone());
-        builder = self.auth.wrap(builder).await?;
+        builder = self.wrap_auth_or_session_token(builder).await?;
         let resp = builder.headers(headers.clone()).send().await?;
         if resp.status() != 200 {
-            let resp_err = QueryError {
-                code: resp.status().as_u16(),
-                message: format!("kill query failed: {}", resp.text().await?),
-                detail: None,
-            };
-            return Err(Error::InvalidResponse(resp_err));
+            return Err(Error::response_error(resp.status(), &resp.bytes().await?)
+                .with_context("kill query"));
         }
         Ok(())
     }
@@ -460,18 +459,20 @@ impl APIClient {
         Some(pagination)
     }
 
-    async fn make_headers(&self, query_id: &str) -> Result<HeaderMap> {
+    fn make_headers(&self, query_id: Option<&str>) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         if let Some(tenant) = &self.tenant {
             headers.insert(HEADER_TENANT, tenant.parse()?);
         }
-        let warehouse = self.warehouse.lock().await;
-        if let Some(warehouse) = &*warehouse {
+        let warehouse = self.warehouse.lock().clone();
+        if let Some(warehouse) = warehouse {
             headers.insert(HEADER_WAREHOUSE, warehouse.parse()?);
         }
         let route_hint = self.route_hint.current();
         headers.insert(HEADER_ROUTE_HINT, route_hint.parse()?);
-        headers.insert(HEADER_QUERY_ID, query_id.parse()?);
+        if let Some(query_id) = query_id {
+            headers.insert(HEADER_QUERY_ID, query_id.parse()?);
+        }
         Ok(headers)
     }
 
@@ -486,43 +487,12 @@ impl APIClient {
             "insert with stage: {}, format: {:?}, copy: {:?}",
             sql, file_format_options, copy_options
         );
-        let session_state = self.session_state().await;
         let stage_attachment = Some(StageAttachmentConfig {
             location: stage,
             file_format_options: Some(file_format_options),
             copy_options: Some(copy_options),
         });
-        let req = QueryRequest::new(sql)
-            .with_pagination(self.make_pagination())
-            .with_session(Some(session_state))
-            .with_stage_attachment(stage_attachment);
-        let endpoint = self.endpoint.join("v1/query")?;
-        let query_id = self.gen_query_id();
-        let headers = self.make_headers(&query_id).await?;
-
-        let mut builder = self.cli.post(endpoint.clone()).json(&req);
-        builder = self.auth.wrap(builder).await?;
-        let mut resp = builder.headers(headers.clone()).send().await?;
-        let mut retries = 3;
-        while resp.status() != 200 {
-            if resp.status() != 503 || retries <= 0 {
-                break;
-            }
-            retries -= 1;
-            let mut builder = self.cli.post(endpoint.clone()).json(&req);
-            builder = self.auth.wrap(builder).await?;
-            resp = builder.headers(headers.clone()).send().await?;
-        }
-        if resp.status() != 200 {
-            let resp_err = QueryError {
-                code: resp.status().as_u16(),
-                message: resp.text().await?,
-                detail: None,
-            };
-            return Err(Error::InvalidResponse(resp_err));
-        }
-
-        let resp: QueryResponse = resp.json().await?;
+        let resp = self.start_query_inner(sql, stage_attachment).await?;
         let resp = self.wait_for_query(resp).await?;
         Ok(resp)
     }
@@ -532,19 +502,19 @@ impl APIClient {
         let sql = format!("PRESIGN UPLOAD {}", stage);
         let resp = self.query(&sql).await?;
         if resp.data.len() != 1 {
-            return Err(Error::Request(
+            return Err(Error::Decode(
                 "Empty response from server for presigned request".to_string(),
             ));
         }
         if resp.data[0].len() != 3 {
-            return Err(Error::Request(
+            return Err(Error::Decode(
                 "Invalid response from server for presigned request".to_string(),
             ));
         }
         // resp.data[0]: [ "PUT", "{\"host\":\"s3.us-east-2.amazonaws.com\"}", "https://s3.us-east-2.amazonaws.com/query-storage-xxxxx/tnxxxxx/stage/user/xxxx/xxx?" ]
         let method = resp.data[0][0].clone().unwrap_or_default();
         if method != "PUT" {
-            return Err(Error::Request(format!(
+            return Err(Error::Decode(format!(
                 "Invalid method for presigned upload request: {}",
                 method
             )));
@@ -583,27 +553,308 @@ impl APIClient {
         size: u64,
     ) -> Result<()> {
         info!("upload to stage with stream: {}, size: {}", stage, size);
+        if let Some(info) = self.need_pre_renew_session().await {
+            self.renew_token(info).await?;
+        }
         let endpoint = self.endpoint.join("v1/upload_to_stage")?;
         let location = StageLocation::try_from(stage)?;
         let query_id = self.gen_query_id();
-        let mut headers = self.make_headers(&query_id).await?;
+        let mut headers = self.make_headers(Some(&query_id))?;
         headers.insert(HEADER_STAGE_NAME, location.name.parse()?);
         let stream = Body::wrap_stream(ReaderStream::new(data));
         let part = Part::stream_with_length(stream, size).file_name(location.path);
         let form = Form::new().part("upload", part);
         let mut builder = self.cli.put(endpoint.clone());
-        builder = self.auth.wrap(builder).await?;
+        builder = self.wrap_auth_or_session_token(builder).await?;
         let resp = builder.headers(headers).multipart(form).send().await?;
         let status = resp.status();
-        let body = resp.bytes().await?;
         if status != 200 {
-            return Err(Error::Request(format!(
-                "Stage Upload Failed: {}",
-                String::from_utf8_lossy(&body)
-            )));
+            return Err(
+                Error::response_error(status, &resp.bytes().await?).with_context("upload_to_stage")
+            );
         }
         Ok(())
     }
+
+    pub async fn login(&mut self) -> Result<()> {
+        let endpoint = self.endpoint.join("/v1/session/login")?;
+        let headers = self.make_headers(None)?;
+        let body = LoginRequest::from(&*self.session_state.lock().await);
+        let builder = self.cli.post(endpoint.clone()).json(&body);
+        let builder = self.auth.wrap(builder).await?;
+        let request = builder
+            .headers(headers.clone())
+            .timeout(self.connect_timeout)
+            .build()?;
+        let response = self.query_request_helper(request, true, false).await;
+        let response = match response {
+            Ok(r) => r,
+            Err(Error::Logic(status, _ec)) if status == 404 => {
+                // old server
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let body = response.bytes().await?;
+        let response = json_from_slice(&body)?;
+        match response {
+            LoginResponse::Err { error } => return Err(Error::AuthFailure(error)),
+            LoginResponse::Ok(info) => {
+                self.login_info = Some(Arc::new(parking_lot::Mutex::new((info, Instant::now()))))
+            }
+        }
+        Ok(())
+    }
+
+    pub fn build_log_out_request(&self, login_info: LoginInfo) -> Result<Request> {
+        let endpoint = self.endpoint.join("/v1/session/logout")?;
+        let body = LogoutRequest {
+            refresh_token: login_info.refresh_token.clone(),
+        };
+        let headers = self.make_headers(None)?;
+        let req = self
+            .cli
+            .post(endpoint.clone())
+            .json(&body)
+            .headers(headers.clone())
+            .bearer_auth(login_info.session_token.clone())
+            .build()?;
+        Ok(req)
+    }
+
+    pub async fn close(&mut self) -> Result<()> {
+        if let Some(info) = mem::take(&mut self.login_info) {
+            let req = self.build_log_out_request(info.lock().0.clone())?;
+            self.cli.execute(req).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn renew_token(
+        &self,
+        self_login_info: Arc<parking_lot::Mutex<(LoginInfo, Instant)>>,
+    ) -> Result<()> {
+        let login_info = { self_login_info.lock().clone() };
+        let endpoint = self.endpoint.join("/v1/session/renew")?;
+        let body = RenewRequest {
+            session_token: login_info.0.session_token.clone(),
+        };
+        let headers = self.make_headers(None)?;
+        let request = self
+            .cli
+            .post(endpoint.clone())
+            .json(&body)
+            .headers(headers.clone())
+            .bearer_auth(login_info.0.refresh_token.clone())
+            .timeout(self.connect_timeout)
+            .build()?;
+
+        // avoid recursively call request_helper
+        for i in 0..3 {
+            let req = request.try_clone().expect("request not cloneable");
+            match self.cli.execute(req).await {
+                Ok(response) => {
+                    let status = response.status();
+                    let body = response.bytes().await?;
+                    if status == StatusCode::OK {
+                        let response = json_from_slice(&body)?;
+                        return match response {
+                            RenewResponse::Err { error } => Err(Error::AuthFailure(error)),
+                            RenewResponse::Ok(info) => {
+                                *self_login_info.lock() = (
+                                    LoginInfo {
+                                        session_token: info.session_token,
+                                        refresh_token: info.refresh_token,
+                                        refresh_token_validity_in_secs: info
+                                            .refresh_token_validity_in_secs,
+                                        session_token_validity_in_secs: info
+                                            .session_token_validity_in_secs,
+                                        ..login_info.0.clone()
+                                    },
+                                    Instant::now(),
+                                );
+                                Ok(())
+                            }
+                        };
+                    }
+                    if status != StatusCode::SERVICE_UNAVAILABLE || i >= 2 {
+                        return Err(Error::response_error(status, &body));
+                    }
+                }
+                Err(err) => {
+                    if !(err.is_timeout() || err.is_connect()) || i > 2 {
+                        return Err(Error::Request(err.to_string()));
+                    }
+                }
+            };
+            sleep(jitter(Duration::from_secs(10))).await;
+        }
+        Ok(())
+    }
+
+    async fn need_pre_renew_session(
+        &self,
+    ) -> Option<Arc<parking_lot::Mutex<(LoginInfo, Instant)>>> {
+        if let Some(login_info) = &self.login_info {
+            let (start, ttl) = {
+                let guard = login_info.lock();
+                (guard.1, guard.0.session_token_validity_in_secs)
+            };
+            if Instant::now() > start + Duration::from_secs(ttl) {
+                return Some(login_info.clone());
+            }
+        }
+        None
+    }
+
+    /// return Ok if and only if status code is 200.
+    ///
+    /// retry on
+    ///   - network errors
+    ///   - (optional) 503
+    ///
+    /// renew databend token or reload jwt token if needed.
+    async fn query_request_helper(
+        &self,
+        mut request: Request,
+        retry_if_503: bool,
+        renew_if_401: bool,
+    ) -> std::result::Result<Response, Error> {
+        let mut renewed = false;
+        let mut retries = 0;
+        loop {
+            let req = request.try_clone().expect("request not cloneable");
+            let (err, retry): (Error, bool) = match self.cli.execute(req).await {
+                Ok(response) => {
+                    let status = response.status();
+                    if status == StatusCode::OK {
+                        return Ok(response);
+                    }
+                    let body = response.bytes().await?;
+                    if retry_if_503 || status == StatusCode::SERVICE_UNAVAILABLE {
+                        // waiting for server to start
+                        (Error::response_error(status, &body), true)
+                    } else {
+                        let resp = serde_json::from_slice::<ResponseWithErrorCode>(&body);
+                        match resp {
+                            Ok(r) => {
+                                let e = r.error;
+                                if status == StatusCode::UNAUTHORIZED {
+                                    request.headers_mut().remove(reqwest::header::AUTHORIZATION);
+                                    if let Some(login_info) = &self.login_info {
+                                        info!(
+                                            "will retry {} after renew token on auth error {}",
+                                            request.url(),
+                                            e
+                                        );
+                                        let retry =
+                                            if need_renew_token(e.code) && !renewed && renew_if_401
+                                            {
+                                                self.renew_token(login_info.clone()).await?;
+                                                renewed = true;
+                                                true
+                                            } else {
+                                                false
+                                            };
+                                        (Error::AuthFailure(e), retry)
+                                    } else if self.auth.can_reload() {
+                                        info!(
+                                            "will retry {} after reload token on auth error {}",
+                                            request.url(),
+                                            e
+                                        );
+                                        let builder = RequestBuilder::from_parts(
+                                            HttpClient::new(),
+                                            request.try_clone().unwrap(),
+                                        );
+                                        let builder = self.auth.wrap(builder).await?;
+                                        request = builder.build()?;
+                                        (Error::AuthFailure(e), true)
+                                    } else {
+                                        (Error::AuthFailure(e), false)
+                                    }
+                                } else {
+                                    (Error::Logic(status, e), false)
+                                }
+                            }
+                            Err(_) => (
+                                Error::Response {
+                                    status,
+                                    msg: String::from_utf8_lossy(&body).to_string(),
+                                },
+                                true,
+                            ),
+                        }
+                    }
+                }
+                Err(err) => (
+                    Error::Request(err.to_string()),
+                    err.is_timeout() || err.is_connect(),
+                ),
+            };
+            if !retry {
+                return Err(err.with_context(&format!(
+                    "fail to {} {} after 3 reties",
+                    request.method(),
+                    request.url()
+                )));
+            }
+            match &err {
+                Error::AuthFailure(_) => {
+                    if renewed {
+                        retries = 0;
+                    } else if retries == 2 {
+                        return Err(err.with_context(&format!(
+                            "fail to {} {} after 3 reties",
+                            request.method(),
+                            request.url()
+                        )));
+                    }
+                }
+                _ => {
+                    if retries == 2 {
+                        return Err(err.with_context(&format!(
+                            "fail to {} {} after 3 reties",
+                            request.method(),
+                            request.url()
+                        )));
+                    }
+                    retries += 1;
+                    info!(
+                        "will retry {} the {retries}th times on error {}",
+                        request.url(),
+                        err
+                    );
+                }
+            }
+            sleep(jitter(Duration::from_secs(10))).await;
+        }
+    }
+}
+
+impl Drop for APIClient {
+    fn drop(&mut self) {
+        if let Some(info) = mem::take(&mut self.login_info) {
+            let cli = self.cli.clone();
+            let req = self.build_log_out_request(info.lock().0.clone()).unwrap();
+            tokio::task::spawn(async move {
+                cli.execute(req).await.ok();
+            });
+        }
+    }
+}
+
+fn json_from_slice<'a, T>(body: &'a [u8]) -> Result<T>
+where
+    T: Deserialize<'a>,
+{
+    serde_json::from_slice::<T>(body).map_err(|e| {
+        Error::Decode(format!(
+            "fail to decode JSON response: {}, body: {}",
+            e,
+            String::from_utf8_lossy(body)
+        ))
+    })
 }
 
 impl Default for APIClient {
@@ -615,7 +866,7 @@ impl Default for APIClient {
             host: "localhost".to_string(),
             port: 8000,
             tenant: None,
-            warehouse: Arc::new(Mutex::new(None)),
+            warehouse: Arc::new(parking_lot::Mutex::new(None)),
             auth: Arc::new(BasicAuth::new("root", "")) as Arc<dyn Auth>,
             session_state: Arc::new(Mutex::new(SessionState::default())),
             wait_time_secs: None,
@@ -626,6 +877,8 @@ impl Default for APIClient {
             tls_ca_file: None,
             presign: PresignMode::Auto,
             route_hint: Arc::new(RouteHintGenerator::new()),
+            disable_session_token: false,
+            login_info: None,
         }
     }
 }

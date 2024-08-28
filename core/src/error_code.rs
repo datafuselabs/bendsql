@@ -12,11 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-const SessionTokenExpired: u16 = 5100;
-const RefreshTokenExpired: u16 = 5100;
-const SessionTokenNotFound: u16 = 5100;
-const RefreshTokenNotFound: u16 = 5100;
+use serde::Deserialize;
+use std::fmt::{Display, Formatter};
+
+const SESSION_TOKEN_EXPIRED: u16 = 5101;
+const SESSION_TOKEN_NOT_FOUND: u16 = 5103;
 
 pub fn need_renew_token(code: u16) -> bool {
-    code == SessionTokenExpired || code == SessionTokenNotFound
+    code == SESSION_TOKEN_EXPIRED || code == SESSION_TOKEN_NOT_FOUND
+}
+
+#[derive(Deserialize, Debug, Clone)]
+pub struct ErrorCode {
+    pub code: u16,
+    pub message: String,
+    pub detail: Option<String>,
+}
+
+/// try to decode to this when status code is not 200.
+/// so the error field is expect to exist.
+#[derive(Deserialize, Debug)]
+pub struct ResponseWithErrorCode {
+    pub error: ErrorCode,
+}
+
+impl Display for ErrorCode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}]{}.{}",
+            self.code,
+            self.message,
+            self.detail.clone().unwrap_or("".to_string())
+        )
+    }
 }
