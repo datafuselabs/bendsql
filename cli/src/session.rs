@@ -102,11 +102,9 @@ impl Session {
                 Err(err) => {
                     match err {
                         databend_driver::Error::Api(
-                            databend_client::error::Error::InvalidResponse(ref resp_err),
+                            databend_client::error::Error::AuthFailure(_),
                         ) => {
-                            if resp_err.code == 401 {
-                                return Err(err.into());
-                            }
+                            return Err(err.into());
                         }
                         databend_driver::Error::Arrow(arrow::error::ArrowError::IpcError(
                             ref ipc_err,

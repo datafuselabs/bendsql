@@ -29,12 +29,12 @@ impl TryFrom<&str> for StageLocation {
     type Error = Error;
     fn try_from(s: &str) -> Result<Self> {
         if !s.starts_with('@') {
-            return Err(Error::Parsing(format!("Invalid stage location: {}", s)));
+            return Err(Error::BadArgument(format!("Invalid stage location: {}", s)));
         }
         let mut parts = s.splitn(2, '/');
         let name = parts
             .next()
-            .ok_or_else(|| Error::Parsing(format!("Invalid stage location: {}", s)))?
+            .ok_or_else(|| Error::BadArgument(format!("Invalid stage location: {}", s)))?
             .trim_start_matches('@');
         let path = parts.next().unwrap_or_default();
         Ok(Self {

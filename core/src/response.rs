@@ -12,16 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::Deserialize;
-
+use crate::error_code::ErrorCode;
 use crate::request::SessionState;
-
-#[derive(Deserialize, Debug)]
-pub struct QueryError {
-    pub code: u16,
-    pub message: String,
-    pub detail: Option<String>,
-}
+use serde::Deserialize;
 
 #[derive(Deserialize, Debug)]
 pub struct QueryStats {
@@ -60,7 +53,7 @@ pub struct QueryResponse {
     pub schema: Vec<SchemaField>,
     pub data: Vec<Vec<Option<String>>>,
     pub state: String,
-    pub error: Option<QueryError>,
+    pub error: Option<ErrorCode>,
     // make it optional for backward compatibility
     pub warnings: Option<Vec<String>>,
     pub stats: QueryStats,
