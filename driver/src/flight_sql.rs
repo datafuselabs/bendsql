@@ -270,7 +270,7 @@ impl Args {
                         return Err(Error::BadArgument(format!(
                             "Invalid value for sslmode: {}",
                             v.as_ref()
-                        )))
+                        )));
                     }
                 },
                 "tls_ca_file" => args.tls_ca_file = Some(v.to_string()),
